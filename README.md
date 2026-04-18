@@ -197,3 +197,7 @@ id|protocol_mode|external_port|target_ip|target_port|iface|up_rate_kbit|down_rat
 - NAT 类型是否满足预期
 - 限速是否符合业务需求
 - 流量累计停用逻辑是否符合你的场景
+
+## License
+
+MIT，详见 `LICENSE`。
