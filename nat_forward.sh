@@ -25,7 +25,7 @@ IPTABLES_NAT_POSTROUTING_CHAIN="GAME_NAT_FORWARD_POSTROUTING"
 IPTABLES_FILTER_FORWARD_CHAIN="GAME_NAT_FORWARD_FORWARD"
 
 DEFAULT_PROTOCOL_MODE="tcp+udp"
-DEFAULT_MAX_TOTAL_MODE="either"
+DEFAULT_MAX_TOTAL_MODE="sum"
 EXPORT_MAGIC="# game-nat-forward export v1"
 BEST_EFFORT_NOTICE="已按开放型 NAT / best-effort Full Cone 方向配置，实际 NAT 类型仍取决于内核能力、运营商网络、上级路由和测试平台判定。"
 RATE_LIMIT_NOTICE="速率限制使用 tc policing / flower 进行 best-effort 限速，不改变 NAT 核心实现；实际吞吐仍会受内核、网卡驱动、上级网络与报文特征影响。"
@@ -282,6 +282,22 @@ validate_nonnegative_int() {
     [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+validate_traffic_limit_input() {
+    [[ "$1" =~ ^[0-9]+([Gg])?$ ]]
+}
+
+normalize_traffic_limit_input() {
+    local value="$1"
+    local gib=1073741824
+
+    if [[ "$value" =~ ^([0-9]+)[Gg]$ ]]; then
+        printf '%s\n' "$(( ${BASH_REMATCH[1]} * gib ))"
+        return 0
+    fi
+
+    printf '%s\n' "$value"
+}
+
 validate_max_total_mode() {
     case "$1" in
         none|either|up|down|sum)
@@ -407,7 +423,12 @@ parse_rule_line() {
     validate_nonnegative_int "$RULE_UP_TOTAL_LIMIT" || return 1
     validate_nonnegative_int "$RULE_DOWN_TOTAL_LIMIT" || return 1
     validate_nonnegative_int "$RULE_MAX_TOTAL_LIMIT" || return 1
-    validate_max_total_mode "$RULE_MAX_TOTAL_MODE" || return 1
+
+    if (( RULE_MAX_TOTAL_LIMIT > 0 )); then
+        RULE_MAX_TOTAL_MODE="sum"
+    else
+        RULE_MAX_TOTAL_MODE="none"
+    fi
 
     return 0
 }
@@ -1074,6 +1095,31 @@ rule_limit_reason() {
     printf '\n'
 }
 
+rule_limit_reason_sum() {
+    local up_bytes="$1"
+    local down_bytes="$2"
+    local up_limit="$3"
+    local down_limit="$4"
+    local max_limit="$5"
+
+    if (( up_limit > 0 && up_bytes >= up_limit )); then
+        printf '上行累计流量达到限制'
+        return 0
+    fi
+
+    if (( down_limit > 0 && down_bytes >= down_limit )); then
+        printf '下行累计流量达到限制'
+        return 0
+    fi
+
+    if (( max_limit > 0 && up_bytes + down_bytes >= max_limit )); then
+        printf '最大累计流量限制触发（上下双向 sum）'
+        return 0
+    fi
+
+    printf '\n'
+}
+
 check_limits() {
     local quiet="${1:-0}"
     local tmp_file
@@ -1097,7 +1143,7 @@ check_limits() {
         fi
 
         read -r down_bytes up_bytes <<< "$(get_rule_total_bytes "$RULE_ID")"
-        reason="$(rule_limit_reason "$up_bytes" "$down_bytes" "$RULE_UP_TOTAL_LIMIT" "$RULE_DOWN_TOTAL_LIMIT" "$RULE_MAX_TOTAL_LIMIT" "$RULE_MAX_TOTAL_MODE")"
+        reason="$(rule_limit_reason_sum "$up_bytes" "$down_bytes" "$RULE_UP_TOTAL_LIMIT" "$RULE_DOWN_TOTAL_LIMIT" "$RULE_MAX_TOTAL_LIMIT")"
         if [[ -n "$reason" ]]; then
             RULE_DISABLED_REASON="$reason"
             changed=1
@@ -1460,6 +1506,74 @@ add_rule() {
     printf '%s\n' "$RATE_LIMIT_NOTICE"
 }
 
+prompt_traffic_limit() {
+    local label="$1"
+    local default_value="$2"
+    local answer
+
+    while true; do
+        read -r -p "$label [默认 $default_value，支持直接输入 100G]: " answer
+        answer="${answer:-$default_value}"
+        if validate_traffic_limit_input "$answer"; then
+            normalize_traffic_limit_input "$answer"
+            return 0
+        fi
+        warn "请输入大于等于 0 的整数，或以 G 结尾的数值（例如 100G）。"
+    done
+}
+
+add_rule_v2() {
+    local protocol_mode
+    local external_port
+    local target_ip
+    local target_port
+    local iface
+    local up_rate_kbit
+    local down_rate_kbit
+    local up_total_limit
+    local down_total_limit
+    local max_total_limit
+    local max_total_mode
+    local rule_id
+
+    protocol_mode="$(prompt_protocol_mode)"
+    external_port="$(prompt_port '本地监听端口（外部入口端口）')"
+    target_ip="$(prompt_ip)"
+    target_port="$(prompt_port '目标端口')"
+    iface="$(prompt_iface)"
+    up_rate_kbit="$(prompt_nonnegative_int '上行速度限制（kbit/s，0 表示不限速）' '0')"
+    down_rate_kbit="$(prompt_nonnegative_int '下行速度限制（kbit/s，0 表示不限速）' '0')"
+    up_total_limit="$(prompt_traffic_limit '上行累计流量限制（单位字节，0 表示不限制，按上行累计计算，满足条件暂停转发）' '0')"
+    down_total_limit="$(prompt_traffic_limit '下行累计流量限制（单位字节，0 表示不限制，按下行累计计算，满足条件暂停转发）' '0')"
+    max_total_limit="$(prompt_traffic_limit '最大累计流量限制（单位字节，0 表示不启用，按上下双向 sum 计算，满足条件暂停转发）' '0')"
+
+    if (( max_total_limit > 0 )); then
+        max_total_mode="$DEFAULT_MAX_TOTAL_MODE"
+    else
+        max_total_mode="none"
+    fi
+
+    if rule_exists "$protocol_mode" "$external_port" "$target_ip" "$target_port"; then
+        warn "相同规则已存在，已拒绝重复添加。"
+        return 0
+    fi
+
+    rule_id="$(generate_rule_id)"
+    append_rule_db "$rule_id" "$protocol_mode" "$external_port" "$target_ip" "$target_port" "$iface" \
+        "$up_rate_kbit" "$down_rate_kbit" "$up_total_limit" "$down_total_limit" "$max_total_limit" "$max_total_mode"
+    stats_set_record "$rule_id" 0 0 0 0
+
+    enable_ipv4_forward
+    install_systemd_units
+    apply_rules
+    systemctl restart "$RESTORE_SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl restart "$CHECK_TIMER_NAME" >/dev/null 2>&1 || true
+
+    printf '规则已添加，ID: %s\n' "$rule_id"
+    printf '%s\n' "$BEST_EFFORT_NOTICE"
+    printf '%s\n' "$RATE_LIMIT_NOTICE"
+}
+
 prompt_rule_id() {
     local answer
     read -r -p "请输入要删除的规则 ID: " answer
@@ -1546,7 +1660,7 @@ main_menu() {
         read -r -p "请选择 [1-8]: " choice
         case "$choice" in
             1)
-                add_rule
+                add_rule_v2
                 ;;
             2)
                 delete_rule
